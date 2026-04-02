@@ -1,1 +1,0 @@
-/usr/bin/c++  -pthread CMakeFiles/concurrency_test.dir/tests/ConcurrencyTest.cpp.o CMakeFiles/concurrency_test.dir/third_party/KamaCache/src/CacheManager.cpp.o CMakeFiles/concurrency_test.dir/third_party/KVstorageBaseRaft/src/RaftNode.cpp.o CMakeFiles/concurrency_test.dir/third_party/KVstorageBaseRaft/src/RaftRpc.cpp.o -o concurrency_test 

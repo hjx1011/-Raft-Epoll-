@@ -1,0 +1,8 @@
+build/
+bin/
+*.o
+*.bin
+*.log
+.vscode/
+raft_state_*.bin
+snapshot_raft_state_*.bin

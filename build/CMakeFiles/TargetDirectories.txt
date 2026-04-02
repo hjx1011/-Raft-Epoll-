@@ -1,5 +1,0 @@
-/home/hjx/projects/KV-Gateway/build/CMakeFiles/raft_node.dir
-/home/hjx/projects/KV-Gateway/build/CMakeFiles/gateway.dir
-/home/hjx/projects/KV-Gateway/build/CMakeFiles/test.dir
-/home/hjx/projects/KV-Gateway/build/CMakeFiles/edit_cache.dir
-/home/hjx/projects/KV-Gateway/build/CMakeFiles/rebuild_cache.dir

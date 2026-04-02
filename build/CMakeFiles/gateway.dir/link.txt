@@ -1,1 +1,0 @@
-/usr/bin/c++  -pthread CMakeFiles/gateway.dir/src/GatewayMain.cpp.o CMakeFiles/gateway.dir/src/network/EpollServer.cpp.o CMakeFiles/gateway.dir/third_party/KamaCache/src/CacheManager.cpp.o CMakeFiles/gateway.dir/third_party/KVstorageBaseRaft/src/RaftNode.cpp.o CMakeFiles/gateway.dir/third_party/KVstorageBaseRaft/src/RaftRpc.cpp.o -o gateway  -lmysqlcppconn -lpthread 
