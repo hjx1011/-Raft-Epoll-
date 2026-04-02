@@ -1,0 +1,1 @@
+/usr/bin/c++  -pthread CMakeFiles/raft_node.dir/third_party/KVstorageBaseRaft/src/main.cpp.o CMakeFiles/raft_node.dir/third_party/KVstorageBaseRaft/src/RaftNode.cpp.o CMakeFiles/raft_node.dir/third_party/KVstorageBaseRaft/src/RaftRpc.cpp.o -o raft_node  -lpthread 
