@@ -48,7 +48,7 @@
 ### 2. 编译项目
 ```bash
 git clone git@github.com:hjx1011/-Raft-Epoll-.git
-cd -Raft-Epoll-
+cd ./-Raft-Epoll-
 mkdir build && cd build
 cmake ..
 make
