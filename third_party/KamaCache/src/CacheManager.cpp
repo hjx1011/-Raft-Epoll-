@@ -3,12 +3,13 @@
 #include <iostream>
 #include <random>
 #include <thread>
+#include "spdlog/spdlog.h"
 
 // 全局 MySQL 客户端
 MySQLClient g_mysql;
 
 auto global_eviction_callback = [](const std::string& k, const std::string& v) {
-    std::cout << "  🗑️ [Cache 淘汰] Key: " << k << ", Val: " << v << std::endl;
+    spdlog::info("🗑️ [Cache 淘汰] Key: {}, Val: {}", k, v);
 };
 
 HighAvailableCacheManager::HighAvailableCacheManager() 
@@ -26,20 +27,26 @@ int HighAvailableCacheManager::get_random_jitter() {
 bool HighAvailableCacheManager::write_data(const std::string& key, const std::string& value) {
     std::string clientId = "Gateway_Node_1";
     
-    // 1. 抢分布式锁：保证全球只有一个网关在改这个 key
+    spdlog::info("[Step 1] 准备向 Raft 集群申请分布式锁: {}", key);
+    
+    // 1. 抢分布式锁
     if (raft_client_.tryLock(key, clientId)) {
+        spdlog::info("[Step 2] 🟢 抢锁成功！准备写入 MySQL...");
         
-        // 2. 写入 MySQL (Source of Truth)
+        // 2. 写入 MySQL
         if (g_mysql.upsert(key, value)) {
-            
-            // 3. 淘汰缓存 (Cache Aside 模式通常选择删除或覆盖，这里选择覆盖并带上随机 TTL)
+            spdlog::info("[Step 3] 🟢 MySQL 写入成功！更新缓存...");
             cache_.put(key, value, 3600 + get_random_jitter());
-            
-            // 4. 释放 Raft 锁
             raft_client_.unlock(key);
             return true;
+        } else {
+            // MySQL 失败分支
+            spdlog::error("[Step 3] 🔴 MySQL 写入失败！请检查：1.密码是否正确 2.kv_project库和kv_table表是否已创建！");
+            raft_client_.unlock(key);
         }
-        raft_client_.unlock(key);
+    } else {
+        // Raft 失败分支
+        spdlog::error("[Step 1] 🔴 获取 Raft 锁失败！请检查 3 个 Raft 节点是否都在运行并选出了 Leader！");
     }
     return false;
 }
@@ -52,7 +59,7 @@ std::string HighAvailableCacheManager::get_data(const std::string& key) {
     if (cache_.get(key, val)) {
         // 【防穿透】：如果是之前存入的空对象标记，直接返回空
         if (val == "[EMPTY_DATA]") return ""; 
-        std::cout << "[Cache] ⚡ 命中缓存: " << key << " -> " << val << std::endl;
+        spdlog::info("[Cache] ⚡ 命中缓存: {} -> {}", key, val);
         return val; 
     }
 
@@ -74,18 +81,18 @@ std::string HighAvailableCacheManager::get_data(const std::string& key) {
     // 再次查缓存，可能刚才排队的时候，前一个线程已经查完库并写回缓存了
     if (cache_.get(key, val)) {
         if (val == "[EMPTY_DATA]") return "";
-        std::cout << "[Cache] 醒来发现别人已经查好了: " << val << std::endl;
+        spdlog::info("[Cache] 醒来发现别人已经查好了: {}", val);
         return val;
     }
 
     // --- 步骤 4：查后端 MySQL ---
-    std::cout << "[DB] 🐌 缓存未命中，开始查库: " << key << "...\n";
+    spdlog::info("[DB] 🐌 缓存未命中，开始查库: {}...", key);
     std::string db_result = g_mysql.query(key); // 修改为查 MySQL
 
     if (db_result.empty()) {
         // --- 步骤 5：【防穿透】 ---
         // 数据库也没有！存入一个短期过期的空对象，防止黑客疯狂查询不存在的 key 攻击 DB
-        std::cout << "[Cache] 🛡️ 数据库也没数据，存入空对象防穿透" << std::endl;
+        spdlog::info("[Cache] 🛡️ 数据库也没数据，存入空对象防穿透");
         cache_.put(key, "[EMPTY_DATA]", 30); // 30秒短期有效
         return "";
     } else {

@@ -5,6 +5,7 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <cstring>
+#include "spdlog/spdlog.h"
 
 #define MAX_EVENTS 1024
 #define BUFFER_SIZE 4096
@@ -37,7 +38,7 @@ EpollServer::EpollServer(int port) : thread_pool_(4) { // 4个工作线程
     event.events = EPOLLIN; // listen_fd 一般用水平触发(LT)即可
     epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, listen_fd_, &event);
 
-    std::cout << "Epoll Server started on port " << port << "\n";
+    spdlog::info("Epoll Server started on port: {}", port);
 }
 
 EpollServer::~EpollServer() {

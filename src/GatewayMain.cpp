@@ -4,7 +4,9 @@
 #include <iostream>
 #include <sstream>
 #include <unistd.h>
-
+#include "spdlog/spdlog.h"
+#include "spdlog/sinks/stdout_color_sinks.h"
+#include "spdlog/sinks/basic_file_sink.h"
 // 全局实例化高可用缓存管理器
 HighAvailableCacheManager g_manager;
 
@@ -23,7 +25,7 @@ void EpollServer::ProcessHttpRequest(int client_fd, const std::string& request) 
     std::string method, path, version;
     iss >> method >> path >> version;
 
-    std::cout << "\n[Gateway 收到请求] " << method << " " << path << "\n";
+    spdlog::info("\n[Gateway 收到请求] {} , {}", method, path);
 
     if (method == "GET" && path.find("/get?key=") == 0) {
         std::string key = path.substr(9);
@@ -59,14 +61,35 @@ void EpollServer::ProcessHttpRequest(int client_fd, const std::string& request) 
 }
 
 int main() {
-    std::cout << "==================================================\n";
-    std::cout << "🚀 终极形态：分布式 KV 存储 API 网关已启动！\n";
-    std::cout << "📡 基于 Epoll + Reactor 异步网络模型\n";
-    std::cout << "🛡️ 接入 ShardARC-Cache 与 Raft 共识集群\n";
-    std::cout << "==================================================\n";
+    spdlog::set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%t][%^%1%$] %v");
+
+    auto console_sink = std::make_shared<spdlog::sinks::stdout_color_sink_mt>();
+    auto file_sink = std::make_shared<spdlog::sinks::basic_file_sink_mt>("logs/gateway.log", true);
+
+    // 2. 创建一个同时输出到屏幕和文件的 Logger
+    // spdlog::logger logger("multi_sink", {console_sink,file_sink});
+    // spdlog::set_default_logger(std::make_shared<spdlog::logger>(logger));
+
+    auto logger = std::make_shared<spdlog::logger>("multi_sink",spdlog::sinks_init_list{console_sink,file_sink});
+
+    spdlog::set_default_logger(logger);
+    // 3. 设置全局日志级别（低于这个级别的日志将不会被处理，极大提升性能）
+    spdlog::set_level(spdlog::level::info);// 上线时可以改成 level::warn
+
+    spdlog::flush_on(spdlog::level::info); 
+
+    spdlog::info("==================================================");
+    spdlog::info("🚀 终极形态：分布式 KV 存储 API 网关已启动");
+    spdlog::info("📡 基于 Epoll + Reactor 异步网络模型");
+    spdlog::info("==================================================");
     
-    // 启动网关服务器，监听 8080 端口
-    EpollServer server(8080);
-    server.start();
+    try{
+        // 启动网关服务器，监听 8080 端口
+        EpollServer server(8080);
+        server.start();
+    } catch (const std::exception& e) {
+        spdlog::critical("网关发生致命错误并崩溃: {}",e.what());
+    }
+    
     return 0;
 }

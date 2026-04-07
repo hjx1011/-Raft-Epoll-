@@ -69,11 +69,11 @@ add_executable(test
 # 6. 链接外部库 (这是报错的关键，必须加上)
 # ==========================================
 
-# 给 Raft 节点链接线程库
-target_link_libraries(raft_node pthread)
+# 给 Raft 节点链接：线程库、日志库
+target_link_libraries(raft_node pthread spdlog fmt)
 
-# 给网关链接：MySQL 库、线程库
-target_link_libraries(gateway mysqlcppconn pthread)
+# 给网关链接：MySQL 库、线程库、日志库
+target_link_libraries(gateway mysqlcppconn pthread spdlog fmt)
 
-# 给并发测试链接：MySQL 库、线程库
-target_link_libraries(test mysqlcppconn pthread)
+# 给并发测试链接：MySQL 库、线程库、日志库
+target_link_libraries(test mysqlcppconn pthread spdlog fmt)

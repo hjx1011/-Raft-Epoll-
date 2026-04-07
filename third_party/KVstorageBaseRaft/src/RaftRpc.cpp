@@ -8,7 +8,7 @@
 #include <iostream>
 #include <thread>
 #include <sstream>
-
+#include "spdlog/spdlog.h"
 // ================= 序列化与反序列化 =================
 
 std::string RaftRpc::serializeRequestVoteArgs(RequestVoteArgs args) {
@@ -112,7 +112,7 @@ void RaftRpc::startRpcServer(int myPort, RaftNode* node, bool& running) {
     bind(server_fd, (struct sockaddr*)&address, sizeof(address));
     listen(server_fd, 10);
 
-    std::cout << "🌐 节点 RPC 服务器已启动，正在监听端口 " << myPort << "...\n";
+    spdlog::info("🌐 节点 RPC 服务器已启动，正在监听端口 {}", myPort);
 
     while (running) {
         int new_socket = accept(server_fd, nullptr, nullptr);

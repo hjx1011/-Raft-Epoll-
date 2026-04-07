@@ -4,10 +4,11 @@
 #include <string>
 #include "RaftNode.h"
 #include "Persister.h"
+#include "spdlog/spdlog.h"
 
 int main(int argc, char* argv[]) {
     if (argc != 2) {
-        std::cout << "用法: ./my_server <节点ID (0/1/2)>\n";
+        spdlog::info("用法: ./my_server <节点ID (0/1/2)>\n");
         return 1;
     }
 
@@ -15,13 +16,13 @@ int main(int argc, char* argv[]) {
     int nodeCount = 3;
 
     if (myId < 0 || myId >= nodeCount) {
-        std::cout << "节点ID必须是 0, 1, 或 2\n";
+        spdlog::info("节点ID必须是 0, 1, 或 2\n");
         return 1;
     }
 
-    std::cout << "===================================\n";
-    std::cout << "  启动 Raft 节点 [" << myId << "] ...\n";
-    std::cout << "===================================\n";
+    spdlog::info("===================================\n");
+    spdlog::info("  启动 Raft 节点 {} ...\n" ,myId);
+    spdlog::info("===================================\n");
 
     auto p = std::make_shared<Persister>(myId);
     RaftNode node(myId, nodeCount, p);
@@ -34,9 +35,9 @@ int main(int argc, char* argv[]) {
     serverThread.detach();
 
     // 【新增】：主线程变成交互式控制台
-    std::cout << "\n--- Raft 控制台已就绪 ---\n";
-    std::cout << "输入 'set key value' 发送命令\n";
-    std::cout << "输入 'snap' 强制生成快照\n";
+    spdlog::info("\n--- Raft 控制台已就绪 ---\n");
+    spdlog::info("输入 'set key value' 发送命令\n");
+    spdlog::info("输入 'snap' 强制生成快照\n");
 
     std::string input;
     while (std::getline(std::cin, input)) {
@@ -52,7 +53,7 @@ int main(int argc, char* argv[]) {
             if (node.isLeader()) {
                 node.sendCommand(input);
             } else {
-                std::cout << "错误：我不是 Leader，请找 Leader 节点！\n";
+                spdlog::info("错误：我不是 Leader，请找 Leader 节点！\n");
             }
         }
     }

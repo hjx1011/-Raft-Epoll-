@@ -3,6 +3,7 @@
 #include <iostream>
 #include <sstream>
 #include <cstring>
+#include "spdlog/spdlog.h"
 
 // 构造函数初始化节点
 RaftNode::RaftNode(int myId, int peers, std::shared_ptr<Persister> p) : me(myId), peerCount(peers), persister(p) {
@@ -18,11 +19,11 @@ RaftNode::RaftNode(int myId, int peers, std::shared_ptr<Persister> p) : me(myId)
         
         // 第一次初始化后，立刻存一次盘
         persist(); 
-        std::cout << "节点 " << me << " 首次启动，初始化成功。\n";
+        spdlog::info("节点 {} 首次启动，初始化成功。", me);
     } else {
         // 情况 B：崩溃重启，调用恢复逻辑
         readPersist(data);
-        std::cout << "节点 " << me << " 崩溃重启成功，已恢复 " << logs.size() << " 条日志。\n";
+        spdlog::info("节点 {} 崩溃重启成功，已恢复 {} 条日志。", me, logs.size());
     }
 
     std::random_device rd;
@@ -59,7 +60,7 @@ void RaftNode::ticker() {
         mtx.unlock(); // 解锁
         
         if (shouldStartElection) {
-            std::cout << "节点超时！大哥死了，我要发起选举！" << std::endl;
+            spdlog::warn("节点 {} 超时！大哥死了，我要发起选举！", me);
             // 变成候选人，开始选举 (我们下一课写这个函数)
             startElection(); 
         }
@@ -80,7 +81,7 @@ void RaftNode::startElection() {
     args.term = currentTerm;
     args.candidateId = me;
     
-    std::cout << "[竞选] 节点 " << me << " 开始竞选！当前任期: " << currentTerm << std::endl;
+    spdlog::info("[竞选] 节点 {} 开始竞选！当前任期: {}", me, currentTerm);
     mtx.unlock(); // 准备发 RPC 前必须解锁！否则会死锁！
 
     // 并发向其他节点拉票
@@ -157,9 +158,9 @@ RequestVoteReply RaftNode::handleRequestVote(RequestVoteArgs args) {
         
         // 巨重要：既然我投票给了别人，说明集群里有活跃的选举，我要重置我的炸弹！
         lastHeartBeat = std::chrono::system_clock::now(); 
-        std::cout << "节点 " << me << " 同意把票投给节点 " << args.candidateId << "\n";
+        spdlog::info("节点 {} 同意把票投给节点 {}", me, args.candidateId);
     } else {
-        std::cout << "节点 " << me << " 拒绝投票给节点 " << args.candidateId << " (我已经投给 " << votedFor << " 了)\n";
+        spdlog::info("节点 {} 拒绝投票给节点 {} (我已经投给 {} 了)", me, args.candidateId, votedFor);
     }
 
     reply.term = currentTerm;
@@ -170,7 +171,7 @@ void RaftNode::becomeLeader() {
     if (state != NodeState::CANDIDATE) return; // 防止重复当选
     
     state = NodeState::LEADER;
-    std::cout << "⭐⭐⭐ [当选] 节点 " << me << " 正式成为 Leader！任期: " << currentTerm << " ⭐⭐⭐\n";
+    spdlog::info("⭐⭐⭐ [当选] 节点 {} 正式成为 Leader！任期: {} ⭐⭐⭐", me, currentTerm);
     
     // 大哥上任的第一件事，就是初始化对小弟们的进度追踪
     for (int i = 0; i < peerCount; i++) {
@@ -255,7 +256,7 @@ void RaftNode::sendHeartbeats() {
                 bool success = false;
                 AppendEntriesReply reply = RaftRpc::callAppendEntries(peerPorts[i], args, success);
                 if (!success) {
-                    // std::cout << "⚠️ Leader " << me << " 发给小弟 " << i << " 的 RPC 超时或失败！\n";
+                    // spdlog::error("⚠️ Leader {} 发给小弟 {} 的 RPC 超时或失败！", me, i);
                     return;
                 }
 
@@ -275,18 +276,13 @@ void RaftNode::sendHeartbeats() {
                         matchIndex[i] = nextIndex[i] - 1;
                         updateCommitIndex();
                     }
-                    // matchIndex[i] = args.prevLogIndex + args.entries.size();
-                    // nextIndex[i] = matchIndex[i] + 1;
-                    // updateCommitIndex(); 
                 } else {
                     if (nextIndex[i] > 1) {
                         if (nextIndex[i] == args.prevLogIndex + 1) {
                             nextIndex[i]--;
                         }
-                        // nextIndex[i]--;
-                        std::cout << "Leader " << me << " 发现小弟 " << i 
-                                  << " 日志对不上，下调其 nextIndex 到 " << nextIndex[i] << "，准备补课\n";
-        }
+                        spdlog::warn("Leader {} 发现小弟 {} 日志对不上，下调其 nextIndex 到 {}，准备补课", me, i, nextIndex[i]);
+                    }
                 }
             }
         }).detach();
@@ -320,7 +316,7 @@ AppendEntriesReply RaftNode::handleAppendEntries(AppendEntriesArgs args) {
 
     // 3. 【断层检查】
     if (getLastLogIndex() < args.prevLogIndex) {
-        std::cout << "  -> 小弟 " << me << " 拒绝日志：日志有断层！\n";
+        spdlog::warn("  -> 小弟 {} 拒绝日志：日志有断层！", me);
         if (needPersist) persist();
         return reply;
     }
@@ -336,7 +332,7 @@ AppendEntriesReply RaftNode::handleAppendEntries(AppendEntriesArgs args) {
                     lastIncludedTerm : logs[getVectorIndex(args.prevLogIndex)].term;
                       
     if (myPrevTerm != args.prevLogTerm) {
-        std::cout << "  -> 小弟 " << me << " 拒绝日志：任期冲突！\n";
+        spdlog::warn("  -> 小弟 {} 拒绝日志：任期冲突！", me);
         if (needPersist) persist();
         return reply;
     }
@@ -365,13 +361,13 @@ AppendEntriesReply RaftNode::handleAppendEntries(AppendEntriesArgs args) {
 
     // 如果大哥发来了真正的日志（不是空心跳），小弟就把它存起来
     if (!args.entries.empty()) {
-        std::cout << "  -> 小弟 " << me << " 成功同步了日志，最新账本写到了第 " << getLastLogIndex() << " 行\n";
+        spdlog::info("  -> 小弟 {} 成功同步了日志，最新账本写到了第 {} 行", me, getLastLogIndex());
     }
 
     if (args.leaderCommit > commitIndex) {
         // 小弟的 commitIndex 不能超过自己本地拥有的最新日志索引
         commitIndex = std::min(args.leaderCommit, getLastLogIndex());
-        std::cout << "  -> 小弟 " << me << " 更新 commitIndex 为: " << commitIndex << "\n";
+        spdlog::info("  -> 小弟 {} 更新 commitIndex 为: {}", me, commitIndex);
         
         applyLogs(); // 【重要新增】：小弟更新 commitIndex 后，立刻应用到状态机！
     }
@@ -400,9 +396,8 @@ void RaftNode::updateCommitIndex() {
         // 如果拥有这条日志的人数过半了！
         if (matchCount > peerCount / 2) {
             commitIndex = n; // 盖棺定论！生效！
-            std::cout << "\n⭐⭐⭐ Leader " << me << " 宣布：第 " << commitIndex 
-                      << " 行日志已被集群【正式提交 (Committed)】！命令是: [" 
-                      << logs[commitIndex].command << "] ⭐⭐⭐\n\n";
+            spdlog::info("⭐⭐⭐ Leader {} 宣布：第 {} 行日志已被集群【正式提交 (Committed)】！命令是: [{}] ⭐⭐⭐", 
+                         me, commitIndex, logs[getVectorIndex(commitIndex)].command);
             
             applyLogs(); // 【重要新增】：Leader 提交后，立刻应用到状态机！
             
@@ -434,8 +429,8 @@ void RaftNode::applyLogs() {
         
         if (op == "SET") {
             kv_db[key] = val; // 真正写入内存数据库！
-            std::cout << "[状态机执行] 节点 " << me << " 已将命令[" << entry.command 
-                      << "] 写入数据库！当前 " << key << " 的值为: " << kv_db[key] << "\n";
+            spdlog::info("[状态机执行] 节点 {} 已将命令[{}] 写入数据库！当前 {} 的值为: {}", 
+                         me, entry.command, key, kv_db[key]);
         }
     }
 }
@@ -505,7 +500,7 @@ bool RaftNode::isLeader() {
 void RaftNode::sendCommand(std::string cmd) {
     std::lock_guard<std::mutex> lock(mtx);
     if (state != NodeState::LEADER) {
-        std::cout << "节点 " << me << " 不是 Leader，拒绝接收命令！\n";
+        spdlog::warn("节点 {} 不是 Leader，拒绝接收命令！", me);
         return;
     }
 
@@ -515,8 +510,7 @@ void RaftNode::sendCommand(std::string cmd) {
     
     persist(); // 【重要新增】：新命令写入日志，必须立刻持久化！
     
-    std::cout << "\n[客户端请求] Leader " << me << " 接收到新命令:[" << cmd
-                << "]，当前日志总数: " << newLogIndex << "\n";
+    spdlog::info("[客户端请求] Leader {} 接收到新命令:[{}]，当前日志总数: {}", me, cmd, newLogIndex);
     
     // 2. 接下来，大哥会在下一次发心跳时，自动把这条新日志带给小弟们
 }
@@ -530,9 +524,8 @@ void RaftNode::snapshot(int index, std::string snapshotData) {
         return;
     }
 
-    std::cout << "\n📸 节点 " << me << " 开始生成快照！截断至真实索引: " << index << "\n";
-
-    // 1. 算出这个真实索引在当前数组里的下标 (这就是你刚才算出来的 2)
+    spdlog::info("📸 节点 {} 开始生成快照！截断至真实索引: {}", me, index);
+    // 1. 算出这个真实索引在当前数组里的下标
     int vecIndex = getVectorIndex(index);
     
     // 2. 更新快照的元数据
@@ -559,7 +552,7 @@ void RaftNode::snapshot(int index, std::string snapshotData) {
     // 调用我们在 Persister 里新写的函数
     persister->SaveStateAndSnapshot(ss.str(), snapshotData);
     
-    std::cout << "📸 快照生成完毕！当前 logs 数组长度缩减为: " << logs.size() << "\n\n";
+    spdlog::info("📸 快照生成完毕！当前 logs 数组长度缩减为: {}", logs.size());
 }
 
 // 【终极 Boss 战】：小弟处理大哥砸过来的快照
@@ -583,7 +576,7 @@ InstallSnapshotReply RaftNode::handleInstallSnapshot(InstallSnapshotArgs args) {
         return reply;
     }
 
-    std::cout << "\n📦 小弟 " << me << " 正在安装大哥发来的快照！截断至: " << args.lastIncludedIndex << "\n";
+    spdlog::info("📦 小弟 {} 正在安装大哥发来的快照！截断至: {}", me, args.lastIncludedIndex);
 
     // 看看我本地有没有快照末尾的那条日志
     int vecIndex = getVectorIndex(args.lastIncludedIndex);
@@ -617,7 +610,7 @@ InstallSnapshotReply RaftNode::handleInstallSnapshot(InstallSnapshotArgs args) {
     }
     persister->SaveStateAndSnapshot(ss.str(), args.data);
 
-    std::cout << "[状态机执行] 节点 " << me << " 已通过快照恢复数据库！\n\n";
+    spdlog::info("[状态机执行] 节点 {} 已通过快照恢复数据库！", me);
 
     return reply;
 }
