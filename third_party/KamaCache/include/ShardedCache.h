@@ -36,6 +36,6 @@ public:
 
     void put(const K& key, const V& value, int ttl_seconds = 0) override {
         size_t index = getShardIndex(key);
-        shards_[index]->put(key, value, ttl_seconds);          
+        shards_[index]->put(key, value, ttl_seconds);
     }
 };

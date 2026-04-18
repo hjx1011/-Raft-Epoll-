@@ -1,210 +1,175 @@
 #include "RaftRpc.h"
 #include "RaftNode.h"
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <unistd.h>
-#include <cstring>
-#include <iostream>
-#include <thread>
-#include <sstream>
-#include "spdlog/spdlog.h"
-// ================= 序列化与反序列化 =================
+#include "raft.grpc.pb.h" // gRPC 自动生成的头文件
+#include <grpcpp/grpcpp.h>
+#include <spdlog/spdlog.h>
+#include <unordered_map>
+#include <mutex>
 
-std::string RaftRpc::serializeRequestVoteArgs(RequestVoteArgs args) {
-    return "RV_REQ\n" + std::to_string(args.term) + "\n" + std::to_string(args.candidateId) + "\n";
-}
+using grpc::Server;
+using grpc::ServerBuilder;
+using grpc::ServerContext;
+using grpc::Status;
+using grpc::ClientContext;
 
-RequestVoteReply RaftRpc::deserializeRequestVoteReply(std::string data) {
-    RequestVoteReply reply;
-    std::stringstream ss(data);
-    std::string type;
-    int granted;
-    ss >> type >> reply.term >> granted;
-    reply.voteGranted = (granted == 1);
-    return reply;
-}
+// ================= 1. gRPC 服务端实现 =================
+class RaftServiceImpl final : public raft::RaftService::Service {
+    RaftNode* node_;
+public:
+    RaftServiceImpl(RaftNode* node) : node_(node) {}
 
-std::string RaftRpc::serializeAppendEntriesArgs(AppendEntriesArgs args) {
-    std::stringstream ss;
-    ss << "AE_REQ\n" << args.term << "\n" << args.leaderId << "\n"
-       << args.prevLogIndex << "\n" << args.prevLogTerm << "\n"
-       << args.leaderCommit << "\n" << args.entries.size() << "\n";
-    for (auto& e : args.entries) {
-        ss << e.term << " " << e.command << "\n";
-    }
-    return ss.str();
-}
+    Status RequestVote(ServerContext* context, const raft::RequestVoteArgs* request, raft::RequestVoteReply* reply) override {
+        // 将 gRPC 请求中的 4 个字段全部提取出来，填入你的 C++ 结构体
+        RequestVoteArgs args;
+        args.term = request->term();
+        args.candidateId = request->candidateid();
+        args.lastLogIndex = request->lastlogindex(); // 【新增】
+        args.lastLogTerm = request->lastlogterm();   // 【新增】
 
-AppendEntriesReply RaftRpc::deserializeAppendEntriesReply(std::string data) {
-    AppendEntriesReply reply;
-    std::stringstream ss(data);
-    std::string type;
-    int successInt;
-    ss >> type >> reply.term >> successInt;
-    reply.success = (successInt == 1);
-    return reply;
-}
+        // 调用 RaftNode 的逻辑处理
+        RequestVoteReply res = node_->handleRequestVote(args);
 
-// ================= 底层 TCP 发送 =================
-
-std::string RaftRpc::sendTcpRequest(int targetPort, std::string requestData) {
-    int sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock < 0) return "";
-
-    struct sockaddr_in serv_addr;
-    memset(&serv_addr, 0, sizeof(serv_addr));
-    serv_addr.sin_family = AF_INET;
-    serv_addr.sin_port = htons(targetPort);
-    inet_pton(AF_INET, "127.0.0.1", &serv_addr.sin_addr);
-
-    // 100ms 超时
-    struct timeval tv;
-    tv.tv_sec = 0;
-    tv.tv_usec = 500000; 
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof tv);
-    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (const char*)&tv, sizeof tv);
-
-    if (connect(sock, (struct sockaddr*)&serv_addr, sizeof(serv_addr)) < 0) {
-        close(sock);
-        return "";
+        // 返回结果
+        reply->set_term(res.term);
+        reply->set_votegranted(res.voteGranted);
+        return Status::OK;
     }
 
-    send(sock, requestData.c_str(), requestData.size(), 0);
-    char buffer[4096] = {0}; // 缓冲区开大一点，防止日志太多装不下
-    int bytes_read = read(sock, buffer, 4096);
-    close(sock);
+    Status AppendEntries(ServerContext* context, const raft::AppendEntriesArgs* request, raft::AppendEntriesReply* reply) override {
+        AppendEntriesArgs args;
+        args.term = request->term();
+        args.leaderId = request->leaderid();
+        args.prevLogIndex = request->prevlogindex();
+        args.prevLogTerm = request->prevlogterm();
+        args.leaderCommit = request->leadercommit();
+        
+        // 【核心优化】：预分配内存，避免 vector 扩容时的多次拷贝开销
+        args.entries.reserve(request->entries_size());
+        for (int i = 0; i < request->entries_size(); i++) {
+            // 【核心优化】：使用 emplace_back 原地构造，避免产生临时对象
+            args.entries.emplace_back(request->entries(i).term(), request->entries(i).command());
+        }
+        
+        AppendEntriesReply res = node_->handleAppendEntries(args);
+        reply->set_term(res.term);
+        reply->set_success(res.success);
+        return Status::OK;
+    }
 
-    if (bytes_read > 0) return std::string(buffer, bytes_read);
-    return "";
-}
+    Status InstallSnapshot(ServerContext* context, const raft::InstallSnapshotArgs* request, raft::InstallSnapshotReply* reply) override {
+        InstallSnapshotArgs args{request->term(), request->leaderid(), request->lastincludedindex(), request->lastincludedterm(), request->data()};
+        InstallSnapshotReply res = node_->handleInstallSnapshot(args);
+        reply->set_term(res.term);
+        return Status::OK;
+    }
 
-// ================= 高级 RPC 接口 =================
+    Status AttemptLock(ServerContext* context, const raft::LockArgs* request, raft::LockReply* reply) override {
+        reply->set_code(node_->attemptLock(request->resource(), request->clientid()));
+        return Status::OK;
+    }
 
-RequestVoteReply RaftRpc::callRequestVote(int targetPort, RequestVoteArgs args, bool& success) {
-    std::string reqData = serializeRequestVoteArgs(args);
-    std::string replyData = sendTcpRequest(targetPort, reqData);
-    if (replyData.empty()) { success = false; return RequestVoteReply{}; }
-    success = true;
-    return deserializeRequestVoteReply(replyData);
-}
-
-AppendEntriesReply RaftRpc::callAppendEntries(int targetPort, AppendEntriesArgs args, bool& success) {
-    std::string reqData = serializeAppendEntriesArgs(args);
-    std::string replyData = sendTcpRequest(targetPort, reqData);
-    if (replyData.empty()) { success = false; return AppendEntriesReply{}; }
-    success = true;
-    return deserializeAppendEntriesReply(replyData);
-}
-
-// ================= RPC 服务端监听 =================
+    Status ReleaseLock(ServerContext* context, const raft::UnlockArgs* request, raft::UnlockReply* reply) override {
+        node_->releaseLock(request->resource());
+        reply->set_success(true);
+        return Status::OK;
+    }
+};
 
 void RaftRpc::startRpcServer(int myPort, RaftNode* node, bool& running) {
-    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
-    int opt = 1;
-    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR , &opt, sizeof(opt));
+    std::string server_address("0.0.0.0:" + std::to_string(myPort));
+    RaftServiceImpl service(node);
+    ServerBuilder builder;
+    builder.AddListeningPort(server_address, grpc::InsecureServerCredentials());
+    builder.RegisterService(&service);
+    std::unique_ptr<Server> server(builder.BuildAndStart());
+    spdlog::info("🌐 gRPC 服务器已启动，监听端口 {}", myPort);
+    server->Wait(); // 阻塞运行
+}
 
-    struct sockaddr_in address;
-    address.sin_family = AF_INET;
-    address.sin_addr.s_addr = INADDR_ANY;
-    address.sin_port = htons(myPort);
+// ================= 2. gRPC 客户端实现 (自带多路复用连接池) =================
+static std::unordered_map<int, std::shared_ptr<raft::RaftService::Stub>> g_stubs;
+static std::mutex g_stub_mtx;
 
-    bind(server_fd, (struct sockaddr*)&address, sizeof(address));
-    listen(server_fd, 10);
-
-    spdlog::info("🌐 节点 RPC 服务器已启动，正在监听端口 {}", myPort);
-
-    while (running) {
-        int new_socket = accept(server_fd, nullptr, nullptr);
-        if (new_socket < 0) continue;
-
-        std::thread([node, new_socket]() {
-            char buffer[4096] = {0};
-            read(new_socket, buffer, 4096);
-            std::string request(buffer);
-            std::string response = "";
-
-            if (request.substr(0, 6) == "RV_REQ") {
-                RequestVoteArgs args;
-                std::stringstream ss(request);
-                std::string type;
-                ss >> type >> args.term >> args.candidateId;
-                
-                RequestVoteReply reply = node->handleRequestVote(args);
-                response = "RV_REP\n" + std::to_string(reply.term) + "\n" + (reply.voteGranted ? "1" : "0") + "\n";
-            } 
-            else if (request.substr(0, 6) == "AE_REQ") {
-                AppendEntriesArgs args;
-                std::stringstream ss(request);
-                std::string type;
-                int logSize;
-                ss >> type >> args.term >> args.leaderId >> args.prevLogIndex >> args.prevLogTerm >> args.leaderCommit >> logSize;
-                
-                std::string dummy;
-                std::getline(ss, dummy); // 跳过换行符
-                for (int i = 0; i < logSize; i++) {
-                    int term;
-                    std::string cmd;
-                    ss >> term;
-                    std::getline(ss, cmd);
-                    if (!cmd.empty() && cmd[0] == ' ') cmd.erase(0, 1);
-                    args.entries.push_back(LogEntry(term, cmd));
-                }
-
-                AppendEntriesReply reply = node->handleAppendEntries(args);
-                response = "AE_REP\n" + std::to_string(reply.term) + "\n" + (reply.success ? "1" : "0") + "\n";
-            } else if (request.substr(0, 6) == "IS_REQ") {
-                InstallSnapshotArgs args;
-                std::stringstream ss(request);
-                std::string type;
-                ss >> type >> args.term >> args.leaderId >> args.lastIncludedIndex >> args.lastIncludedTerm;
-                
-                std::string dummy;
-                std::getline(ss, dummy); // 跳过换行符
-                
-                // 【修改】：使用 '\0' 作为分隔符，强制读取剩下的所有字符串！
-                std::getline(ss, args.data, '\0'); 
-                
-                InstallSnapshotReply reply = node->handleInstallSnapshot(args);
-                response = "IS_REP\n" + std::to_string(reply.term) + "\n";
-            } else if (request.substr(0, 8) == "CLI_LOCK") {
-                std::stringstream ss(request.substr(9));
-                std::string res, cid;
-                ss >> res >> cid;
-                int code = node->attemptLock(res, cid);
-                response = "LOCK_REP\n" + std::to_string(code);
-            }
-            else if (request.substr(0, 10) == "CLI_UNLOCK") {
-                std::string res = request.substr(11);
-                res.erase(res.find_last_not_of(" \n\r\t") + 1);
-                node->releaseLock(res);
-                response = "LOCK_REP\nOK";
-            }
-
-            send(new_socket, response.c_str(), response.size(), 0);
-            close(new_socket);
-        }).detach();
+// 获取 gRPC Stub (底层自动维护 HTTP/2 长连接)
+std::shared_ptr<raft::RaftService::Stub> getStub(int port) {
+    std::lock_guard<std::mutex> lock(g_stub_mtx);
+    if (g_stubs.find(port) == g_stubs.end()) {
+        auto channel = grpc::CreateChannel("127.0.0.1:" + std::to_string(port), grpc::InsecureChannelCredentials());
+        g_stubs[port] = raft::RaftService::NewStub(channel);
     }
+    return g_stubs[port];
 }
 
-std::string RaftRpc::serializeInstallSnapshotArgs(InstallSnapshotArgs args) {
-    return "IS_REQ\n" + std::to_string(args.term) + "\n" + std::to_string(args.leaderId) + "\n"
-           + std::to_string(args.lastIncludedIndex) + "\n" + std::to_string(args.lastIncludedTerm) + "\n"
-           + args.data + "\n";
+// 【核心修复】：入参改为 const RequestVoteArgs&，与头文件保持一致，消除编译报错并减少拷贝
+RequestVoteReply RaftRpc::callRequestVote(int targetPort, const RequestVoteArgs& args, bool& success) {
+    raft::RequestVoteArgs req;
+    // 将 C++ 结构体中的 4 个字段填入 gRPC 的请求包中
+    req.set_term(args.term);
+    req.set_candidateid(args.candidateId);
+    req.set_lastlogindex(args.lastLogIndex); // 【新增】
+    req.set_lastlogterm(args.lastLogTerm);   // 【新增】
+
+    raft::RequestVoteReply rep;
+    ClientContext context;
+    // 设置 100ms 超时，防止网络卡死
+    context.set_deadline(std::chrono::system_clock::now() + std::chrono::milliseconds(100));
+
+    Status status = getStub(targetPort)->RequestVote(&context, req, &rep);
+    if (status.ok()) {
+        success = true;
+        return RequestVoteReply{rep.term(), rep.votegranted()};
+    }
+    success = false;
+    return RequestVoteReply{};
 }
 
-InstallSnapshotReply RaftRpc::deserializeInstallSnapshotReply(std::string data) {
-    InstallSnapshotReply reply;
-    std::stringstream ss(data);
-    std::string type;
-    ss >> type >> reply.term;
-    return reply;
+// 【核心修复】：入参改为 const AppendEntriesArgs&
+AppendEntriesReply RaftRpc::callAppendEntries(int targetPort, const AppendEntriesArgs& args, bool& success) {
+    raft::AppendEntriesArgs req;
+    req.set_term(args.term);
+    req.set_leaderid(args.leaderId);
+    req.set_prevlogindex(args.prevLogIndex);
+    req.set_prevlogterm(args.prevLogTerm);
+    req.set_leadercommit(args.leaderCommit);
+    
+    // 【核心优化】：让 Protobuf 底层预分配内存，防止大批量日志同步时频繁申请内存
+    req.mutable_entries()->Reserve(args.entries.size());
+    for (const auto& e : args.entries) {
+        auto* entry = req.add_entries();
+        entry->set_term(e.term);
+        entry->set_command(e.command);
+    }
+    
+    raft::AppendEntriesReply rep;
+    ClientContext context;
+    context.set_deadline(std::chrono::system_clock::now() + std::chrono::milliseconds(150)); // 150ms 超时
+
+    Status status = getStub(targetPort)->AppendEntries(&context, req, &rep);
+    if (status.ok()) {
+        success = true;
+        return AppendEntriesReply{rep.term(), rep.success()};
+    }
+    success = false;
+    return AppendEntriesReply{};
 }
 
-InstallSnapshotReply RaftRpc::callInstallSnapshot(int targetPort, InstallSnapshotArgs args, bool& success) {
-    std::string reqData = serializeInstallSnapshotArgs(args);
-    std::string replyData = sendTcpRequest(targetPort, reqData);
-    if (replyData.empty()) { success = false; return InstallSnapshotReply{}; }
-    success = true;
-    return deserializeInstallSnapshotReply(replyData);
+// 【核心修复】：入参改为 const InstallSnapshotArgs&
+InstallSnapshotReply RaftRpc::callInstallSnapshot(int targetPort, const InstallSnapshotArgs& args, bool& success) {
+    raft::InstallSnapshotArgs req;
+    req.set_term(args.term);
+    req.set_leaderid(args.leaderId);
+    req.set_lastincludedindex(args.lastIncludedIndex);
+    req.set_lastincludedterm(args.lastIncludedTerm);
+    req.set_data(args.data);
+    raft::InstallSnapshotReply rep;
+    ClientContext context;
+    context.set_deadline(std::chrono::system_clock::now() + std::chrono::milliseconds(500)); 
+
+    Status status = getStub(targetPort)->InstallSnapshot(&context, req, &rep);
+    if (status.ok()) {
+        success = true;
+        return InstallSnapshotReply{rep.term()};
+    }
+    success = false;
+    return InstallSnapshotReply{};
 }

@@ -4,12 +4,14 @@
 #include <sstream>
 #include <cstring>
 #include "spdlog/spdlog.h"
+#include "ThreadPool.h"
 
 // 构造函数初始化节点
-RaftNode::RaftNode(int myId, int peers, std::shared_ptr<Persister> p) : me(myId), peerCount(peers), persister(p) {
+RaftNode::RaftNode(int myId, int peers, std::shared_ptr<Persister> p) : me(myId), peerCount(peers), persister(p),thread_pool_(4) {
     nextIndex.resize(peers, 1);
     matchIndex.resize(peers, 0);
-    
+    // rpcInProgress.resize(peers, false);
+
     std::string data = persister->ReadRaftState();
     if (data.empty()) {
         // 情况 A：第一次启动，初始化默认状态
@@ -28,7 +30,7 @@ RaftNode::RaftNode(int myId, int peers, std::shared_ptr<Persister> p) : me(myId)
 
     std::random_device rd;
     randomGenerator.seed(rd());
-    lastHeartBeat = std::chrono::system_clock::now();
+    lastHeartBeat = std::chrono::steady_clock::now();
     tickerThread = std::thread(&RaftNode::ticker, this);
 }
 
@@ -39,25 +41,26 @@ void RaftNode::ticker() {
 
         bool shouldStartElection = false;
 
-        mtx.lock(); // 巨重要！检查状态必须加锁！
-        
-        if (state != NodeState::LEADER) {
+        {
+            std::lock_guard<std::mutex> lock(mtx); // 自动加锁，作用域结束自动解锁
+            if (state != NodeState::LEADER) {
 
-            // 看看现在几点了
-            auto now = std::chrono::system_clock::now();
-            
-            // 算一下：距离上一次收到心跳，过去了多少毫秒？
-            auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastHeartBeat).count();
-            // 生成一个 150 ~ 300 之间的随机数，作为今天的炸弹超时时间
-            std::uniform_int_distribution<int> dist(150, 300);
-            int timeout = dist(randomGenerator);
-                // 核心判断：如果过去的时间，超过了随机指定的超时时间，炸弹爆炸！
-            if (duration > timeout) {
-                shouldStartElection = true; // 标记一下，我们要开始选举了
-                lastHeartBeat = std::chrono::system_clock::now(); 
+                // 看看现在几点了
+                auto now = std::chrono::steady_clock::now();
+                
+                // 算一下：距离上一次收到心跳，过去了多少毫秒？
+                auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastHeartBeat).count();
+                // 生成一个 150 ~ 300 之间的随机数，作为今天的炸弹超时时间
+                std::uniform_int_distribution<int> dist(1000, 2000);
+                int timeout = dist(randomGenerator);
+                    // 核心判断：如果过去的时间，超过了随机指定的超时时间，炸弹爆炸！
+                if (duration > timeout) {
+                    shouldStartElection = true; // 标记一下，我们要开始选举了
+                    lastHeartBeat = std::chrono::steady_clock::now(); 
+                }
             }
         }
-        mtx.unlock(); // 解锁
+        
         
         if (shouldStartElection) {
             spdlog::warn("节点 {} 超时！大哥死了，我要发起选举！", me);
@@ -69,26 +72,34 @@ void RaftNode::ticker() {
 }
 
 void RaftNode::startElection() {
-    mtx.lock(); // 注意：这里手动加锁，因为后面要解锁
-    state = NodeState::CANDIDATE;
-    currentTerm++;
-    votedFor = me;
-    currentVotes = 1; // 投给自己一票
-    persist(); // 【重要新增】：任期和投票变了，立刻持久化
-    
-    // 准备发送的参数
     RequestVoteArgs args;
-    args.term = currentTerm;
-    args.candidateId = me;
     
-    spdlog::info("[竞选] 节点 {} 开始竞选！当前任期: {}", me, currentTerm);
-    mtx.unlock(); // 准备发 RPC 前必须解锁！否则会死锁！
+    {
+        // 【核心优化】：使用 RAII 自动管理锁，替代危险的手动 mtx.lock() 和 unlock()
+        std::lock_guard<std::mutex> lock(mtx); 
+        state = NodeState::CANDIDATE;
+        currentTerm++;
+        votedFor = me;
+        currentVotes = 1; // 投给自己一票
+        persist(); // 【重要新增】：任期和投票变了，立刻持久化
+        
+        // 准备发送的参数
+        args.term = currentTerm;
+        args.candidateId = me;
+        // 【核心修复】：告知别人我目前的进度
+        args.lastLogIndex = getLastLogIndex();
+        args.lastLogTerm = getLastLogTerm();
+        
+        lastHeartBeat = std::chrono::steady_clock::now(); // 重置自己的炸弹
+        spdlog::info("[竞选] 节点 {} 开始竞选！当前任期: {}", me, currentTerm);
+    } // 作用域结束，自动解锁！准备发 RPC 前必须解锁！否则会死锁！
 
     // 并发向其他节点拉票
     for (int i = 0; i < peerCount; i++) {
         if (i == me) continue;
 
-        std::thread([this, i, args]() {
+        // 【核心优化】：将拉票任务扔进线程池，彻底消灭 std::thread().detach() 带来的线程爆炸隐患
+        thread_pool_.enqueue([this, i, args]() {
             // 调用真实的拉票逻辑
             bool granted = sendRequestVote(i, args);
             
@@ -101,7 +112,7 @@ void RaftNode::startElection() {
                     becomeLeader();
                 }
             }
-        }).detach(); 
+        }); 
     }
 }
 
@@ -122,6 +133,7 @@ bool RaftNode::sendRequestVote(int targetId, RequestVoteArgs args) {
         currentTerm = reply.term;
         state = NodeState::FOLLOWER;
         votedFor = -1;
+        lastHeartBeat = std::chrono::steady_clock::now(); 
         persist(); // 【重要新增】：发现更高任期，重置状态并持久化
         return false;
     }
@@ -146,19 +158,24 @@ RequestVoteReply RaftNode::handleRequestVote(RequestVoteArgs args) {
         currentTerm = args.term;
         state = NodeState::FOLLOWER;
         votedFor = -1; // 新任期，我还没投过票
+        lastHeartBeat = std::chrono::steady_clock::now(); //只要 Term 增加，就说明进入了新纪元，重置炸弹防止干扰新 Leader
         persist(); // 【重要新增】：任期更新，持久化
     }
 
+    bool logOk = (args.lastLogTerm > getLastLogTerm()) ||
+                 (args.lastLogTerm == getLastLogTerm() && args.lastLogIndex >= getLastLogIndex());
     // 3. 决定是否投票：
     // 如果我还没投过票 (votedFor == -1)，或者我已经投给这个人了 (votedFor == args.candidateId)
     if (votedFor == -1 || votedFor == args.candidateId) {
-        votedFor = args.candidateId; // 记录下我把票投给了谁
-        persist(); // 【重要新增】：决定投票给某人，必须持久化
-        reply.voteGranted = true;    // 同意投票！
-        
-        // 巨重要：既然我投票给了别人，说明集群里有活跃的选举，我要重置我的炸弹！
-        lastHeartBeat = std::chrono::system_clock::now(); 
-        spdlog::info("节点 {} 同意把票投给节点 {}", me, args.candidateId);
+        if (logOk) {
+            votedFor = args.candidateId; // 记录下我把票投给了谁
+            persist(); // 【重要新增】：决定投票给某人，必须持久化
+            reply.voteGranted = true;    // 同意投票！
+            
+            // 巨重要：既然我投票给了别人，说明集群里有活跃的选举，我要重置我的炸弹！
+            lastHeartBeat = std::chrono::steady_clock::now(); 
+            spdlog::info("节点 {} 同意把票投给节点 {}", me, args.candidateId);
+        }
     } else {
         spdlog::info("节点 {} 拒绝投票给节点 {} (我已经投给 {} 了)", me, args.candidateId, votedFor);
     }
@@ -186,9 +203,10 @@ void RaftNode::becomeLeader() {
 void RaftNode::startHeartbeatTimer() {
     // 开启一个心跳线程
     std::thread([this]() {
+        sendHeartbeats(); // 【修复】：当选后立即发送一次心跳，安抚小弟，重置他们的炸弹
         while (state == NodeState::LEADER && running) {
             // 大哥每隔 50ms 发一次，必须比 150ms 的炸弹快得多！
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            std::this_thread::sleep_for(std::chrono::milliseconds(300));
             
             sendHeartbeats();
         }
@@ -196,11 +214,30 @@ void RaftNode::startHeartbeatTimer() {
 }
 
 void RaftNode::sendHeartbeats() {
+    // 【核心优化】：在往线程池塞任务前，先检查一下自己还是不是 Leader。
+    // 防止退位后依然疯狂往线程池塞入废弃的心跳任务。
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        if (state != NodeState::LEADER) return;
+    }
+
     for (int i = 0; i < peerCount; i++) {
         if (i == me) continue;
 
-        // 并发给每个小弟发包
-        std::thread([this, i]() {
+        // // 【防爆护盾 1】：如果上一个包还没发完，直接跳过，防止线程池被塞满！
+        // mtx.lock();
+        // if (rpcInProgress[i]) {
+        //     mtx.unlock();
+        //     continue; 
+        // }
+        // rpcInProgress[i] = true;
+        // mtx.unlock();
+        // // 并发给每个小弟发包
+        thread_pool_.enqueue([this, i]() {
+            // std::shared_ptr<void> guard(nullptr, [this, i](void*) {
+            //     std::lock_guard<std::mutex> lock(this->mtx);
+            //     this->rpcInProgress[i] = false;
+            // });
             AppendEntriesArgs args;
             bool needInstallSnapshot = false;
             InstallSnapshotArgs snapArgs;
@@ -285,7 +322,7 @@ void RaftNode::sendHeartbeats() {
                     }
                 }
             }
-        }).detach();
+        });
     }
 }    
 
@@ -311,7 +348,7 @@ AppendEntriesReply RaftNode::handleAppendEntries(AppendEntriesArgs args) {
     }
     
     state = NodeState::FOLLOWER; // 哪怕我之前是 Candidate，现在也得认怂
-    lastHeartBeat = std::chrono::system_clock::now(); // 【重置炸弹】
+    lastHeartBeat = std::chrono::steady_clock::now(); // 【重置炸弹】
     reply.term = currentTerm;
 
     // 3. 【断层检查】
@@ -422,15 +459,22 @@ void RaftNode::applyLogs() {
         // 忽略占位日志或空心跳
         if (entry.command == "InitLog" || entry.command.empty()) continue;
 
-        // 简单的命令解析：假设格式是 "SET KEY VALUE"
+        // 简单的命令解析：假设格式是 "SET KEY VALUE" 或 "DEL KEY"
         std::stringstream ss(entry.command);
         std::string op, key, val;
-        ss >> op >> key >> val;
+        ss >> op >> key;
         
+        // 【核心修复】：支持 DEL 命令！否则 releaseLock 产生的 DEL 日志无法被状态机执行，导致死锁！
         if (op == "SET") {
+            // 如果 val 有空格，getline 可以读完剩下的
+            std::getline(ss >> std::ws, val); 
             kv_db[key] = val; // 真正写入内存数据库！
             spdlog::info("[状态机执行] 节点 {} 已将命令[{}] 写入数据库！当前 {} 的值为: {}", 
                          me, entry.command, key, kv_db[key]);
+        } else if (op == "DEL") {
+            kv_db.erase(key); // 从内存数据库中删除！
+            spdlog::info("[状态机执行] 节点 {} 已执行删除命令[{}]！键 {} 已被移除", 
+                         me, entry.command, key);
         }
     }
 }
@@ -480,7 +524,7 @@ void RaftNode::readPersist(std::string data) {
 }
 
 // 【修改】：初始化集群网络端口（代替以前的指针）
-void RaftNode::setPeerPorts(std::vector<int>& ports) {
+void RaftNode::setPeerPorts(const std::vector<int>& ports) {
     peerPorts = ports;
     myPort = ports[me];
 }
@@ -497,7 +541,7 @@ bool RaftNode::isLeader() {
 }
 
 // 模拟客户端向节点发送命令
-void RaftNode::sendCommand(std::string cmd) {
+void RaftNode::sendCommand(const std::string& cmd) {
     std::lock_guard<std::mutex> lock(mtx);
     if (state != NodeState::LEADER) {
         spdlog::warn("节点 {} 不是 Leader，拒绝接收命令！", me);
@@ -516,7 +560,7 @@ void RaftNode::sendCommand(std::string cmd) {
 }
 
 // 【新增】：生成快照并截断日志
-void RaftNode::snapshot(int index, std::string snapshotData) {
+void RaftNode::snapshot(int index, const std::string& snapshotData) {
     std::lock_guard<std::mutex> lock(mtx);
     
     // 如果请求截断的索引还没提交，或者已经被截断过了，直接忽略
@@ -568,7 +612,7 @@ InstallSnapshotReply RaftNode::handleInstallSnapshot(InstallSnapshotArgs args) {
     currentTerm = args.term;
     votedFor = -1;
     state = NodeState::FOLLOWER;
-    lastHeartBeat = std::chrono::system_clock::now(); // 重置炸弹！
+    lastHeartBeat = std::chrono::steady_clock::now(); // 重置炸弹！
     reply.term = currentTerm;
 
     // 如果我已经有这个快照（或更新的快照）了，直接忽略

@@ -10,6 +10,7 @@
 #include "Persister.h"
 #include <memory>
 #include <unordered_map>
+#include "ThreadPool.h"
 
 // 注意：这里不需要引入 socket 相关的头文件了，因为网络层已经被剥离到了 RaftRpc 中！
 // 也不需要 #include "RaftRpc.h"，在 RaftNode.cpp 里引入即可，保持头文件清爽。
@@ -38,7 +39,7 @@ private:
     NodeState state = NodeState::FOLLOWER; // 节点当前身份：跟随者、候选人、或领导者
 
     // --- 定时炸弹（选举超时）相关 ---
-    std::chrono::time_point<std::chrono::system_clock> lastHeartBeat; // 上一次收到大哥心跳的时间
+    std::chrono::time_point<std::chrono::steady_clock> lastHeartBeat; // 上一次收到大哥心跳的时间
     std::thread tickerThread;         // 后台倒计时线程，负责触发选举
     std::mt19937 randomGenerator;     // 随机数生成器，用于生成 150ms~300ms 的随机超时时间
 
@@ -56,18 +57,14 @@ private:
     int lastIncludedIndex = 0; // 快照替代的最高日志条目的索引
     int lastIncludedTerm = 0;  // 快照替代的最高日志条目的任期
 
+    ThreadPool thread_pool_;
+
     void ticker();
-
     void startElection();
-
     bool sendRequestVote(int targetId, RequestVoteArgs args);
-
     void becomeLeader();
-
     void startHeartbeatTimer();
-
     void sendHeartbeats();
-
     void updateCommitIndex(); 
 
     // 【新增】两个私有方法，负责把状态打包和解包
@@ -75,7 +72,7 @@ private:
     void readPersist(std::string data);
     void applyLogs();
 
-        // 获取某条日志的真实索引
+    // 获取某条日志的真实索引
     int getAbsoluteIndex(int vectorIndex) {
         return vectorIndex + lastIncludedIndex;
     }
@@ -85,38 +82,36 @@ private:
         return absoluteIndex - lastIncludedIndex;
     }
 
-    
 public: 
-
     RaftNode(int myId, int peers, std::shared_ptr<Persister> p);
-
     ~RaftNode();
 
     AppendEntriesReply handleAppendEntries(AppendEntriesArgs args);
-
     RequestVoteReply handleRequestVote(RequestVoteArgs args);
-
-    void setPeerPorts(std::vector<int>& ports);
+    
+    // 【核心优化】：如果只读不写，传递 const 引用以避免拷贝开销
+    void setPeerPorts(const std::vector<int>& ports);
 
     void startRpcServer();
 
-    bool isLeader();
+    [[nodiscard]] bool isLeader(); // 【核心优化】：标记不可忽略返回值，保障逻辑严谨
 
-    void sendCommand(std::string cmd);
+    void sendCommand(const std::string& cmd);
 
     //[RPC 处理] 处理大哥发来的快照安装请求
     InstallSnapshotReply handleInstallSnapshot(InstallSnapshotArgs args);
 
-    // [外部接口] 状态机主动调用：告诉 Raft 节点“我已经把状态存下来了，你可以把 index 之前的日志删了”
-    void snapshot(int index, std::string snapshotData);
+    //[外部接口] 状态机主动调用：告诉 Raft 节点“我已经把状态存下来了，你可以把 index 之前的日志删了”
+    // 【核心优化】：字符串参数传递 const 引用
+    void snapshot(int index, const std::string& snapshotData);
 
     // 获取当前节点拥有的最后一条日志的真实索引
-    int getLastLogIndex() {
+    [[nodiscard]] int getLastLogIndex() {
         return lastIncludedIndex + logs.size() - 1;
     }
 
     // 获取当前节点拥有的最后一条日志的任期
-    int getLastLogTerm() {
+    [[nodiscard]] int getLastLogTerm() {
         if (logs.size() == 1) { // 如果数组里只剩一个占位符，说明全被快照了
             return lastIncludedTerm;
         } else {

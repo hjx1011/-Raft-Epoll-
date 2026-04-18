@@ -1,0 +1,72 @@
+syntax = "proto3";
+package raft;
+
+message LogEntry {
+    int32 term = 1;
+    string command = 2;
+}
+
+message RequestVoteArgs {
+    int32 term = 1;
+    int32 candidateId = 2;
+    int32 lastLogIndex = 3; // 【新增】
+    int32 lastLogTerm = 4;  // 【新增】
+}
+
+message RequestVoteReply {
+    int32 term = 1;
+    bool voteGranted = 2;
+}
+
+message AppendEntriesArgs {
+    int32 term = 1;
+    int32 leaderId = 2;
+    int32 prevLogIndex = 3;
+    int32 prevLogTerm = 4;
+    repeated LogEntry entries = 5;
+    int32 leaderCommit = 6;
+}
+
+message AppendEntriesReply {
+    int32 term = 1;
+    bool success = 2;
+}
+
+message InstallSnapshotArgs {
+    int32 term = 1;
+    int32 leaderId = 2;
+    int32 lastIncludedIndex = 3;
+    int32 lastIncludedTerm = 4;
+    bytes data = 5;
+}
+
+message InstallSnapshotReply {
+    int32 term = 1;
+}
+
+message LockArgs {
+    string resource = 1;
+    string clientId = 2;
+}
+
+message LockReply {
+    int32 code = 1; // 0: 成功, 1: 被占用, 2: 不是Leader
+}
+
+message UnlockArgs {
+    string resource = 1;
+}
+
+message UnlockReply {
+    bool success = 1;
+}
+
+
+// 定义 gRPC 服务
+service RaftService {
+    rpc RequestVote(RequestVoteArgs) returns (RequestVoteReply);
+    rpc AppendEntries(AppendEntriesArgs) returns (AppendEntriesReply);
+    rpc InstallSnapshot(InstallSnapshotArgs) returns (InstallSnapshotReply);
+    rpc AttemptLock(LockArgs) returns (LockReply);
+    rpc ReleaseLock(UnlockArgs) returns (UnlockReply);
+}
