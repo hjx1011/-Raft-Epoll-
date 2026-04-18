@@ -1,89 +1,106 @@
-基于 C++14 实现的工业级分布式高并发 API 网关系统。集成了**高性能异步网络模型**、**自适应缓存淘汰算法**以及**分布式强一致性共识协议**。
+# Ultimate-KV-Gateway：工业级分布式高并发 API 网关系统
+
+## 📖 项目简介
+
+本项目是一个基于 C++14 开发的高性能、分布式 API 网关系统。它不仅实现了高性能的 **Epoll-Reactor** 异步网络引擎，还自研了具备 **ARC (Adaptive Replacement Cache)** 淘汰算法的分片缓存层。
+
+最核心的特色在于：系统集成了 **Raft 分布式共识协议**，利用 Raft 的强一致性实现了**原生分布式锁**，彻底解决了高并发场景下双写一致性与 MySQL 写入安全问题。
+
+-----
 
 ## 🌟 核心特性 (Features)
 
-- **高性能网络层**: 基于 `epoll` (ET模式) + `Reactor` 架构，结合 C++11 线程池处理海量并发连接。
-- **高吞吐缓存层**: 自研 16 分片锁的 `ARC` (Adaptive Replacement Cache) 淘汰算法，极大地提高了缓存命中率并降低了锁竞争。
-- **企业级高可用保护**: 完整实现了 `Cache-Aside` 旁路缓存策略，内置防御**缓存穿透（空对象标记）**、**缓存击穿（双重检查锁）**、**缓存雪崩（TTL抖动）**。
-- **分布式强一致性**: 纯手工实现 `Raft` 分布式共识协议集群，提供高可靠的元数据存储。
-- **原生分布式锁**: 抛弃传统 Redis 锁方案，利用 Raft 集群强一致性实现底层分布式锁，保障并发环境下 MySQL 数据库的绝对写入安全。
+### 1\. 高性能异步网络层
 
-## 🏗️ 架构设计 (Architecture)
+  * **Reactor 模型**: 基于 `epoll` 边缘触发 (ET) 模式实现，结合 `ONESHOT` 事件确保多线程下连接处理的安全性。
+  * **智能线程池**: 使用自定义线程池处理业务逻辑，实现网络 I/O 与业务逻辑的彻底解耦。
 
-系统采用经典的四层工业级解耦架构：读请求通过网关 ARC 缓存秒回；写请求经 Raft 抢占分布式锁后，安全写入 MySQL 持久化。
+### 2\. 强一致性分布式协议 (Raft)
 
-```text[ 外部客户端 (HTTP) ]
-             │
-   ┌─────────▼─────────────────────────────┐
-   │  EpollServer (Reactor 异步网络层)      │ 
-   └─────────┬─────────────────────────────┘
-             ▼
-   ┌───────────────────────────────────────┐
-   │  CacheManager (Cache-Aside 核心逻辑)   │ 
-   └─────────┬──────────────────┬──────────┘
-             │                  │
-      [ 1. 查缓存 ][ 2. 缓存未命中 / 并发写 ]
-             │                  │
-   ┌─────────▼─────────┐  ┌─────▼──────────────┐
-   │  ShardARC-Cache   │  │   RaftKVClient     │ ---> [ MySQL (数据持久化) ]
-   │ (本地高并发缓存)   │  │  (Raft 抢锁控制器)  │
-   └───────────────────┘  └─────┬──────────────┘
-                                │ (自定义 TCP RPC)
-             ┌──────────────────┼──────────────────┐
-             ▼                  ▼                  ▼
-      +------------+      +------------+      +------------+
-      | RaftNode 0 | <──> | RaftNode 1 | <──> | RaftNode 2 |
-      |  (Leader)  |      | (Follower) |      | (Follower) |
-      +------------+      +------------+      +------------+
-```
+  * **完整 Raft 实现**: 纯手工实现 Leader 选举、日志复制、快照安装 (Snapshot) 及持久化恢复逻辑。
+  * **gRPC 通信**: 节点间采用 gRPC 进行高效的二进制数据同步，并内置了连接池优化。
+  * **分布式锁服务**: 基于 Raft 状态机实现 `attemptLock` 和 `releaseLock` 接口，为后端 MySQL 提供独占式写入保护。
 
-## 🛠️ 构建与安装 (Build & Run)
+### 3\. 三级高可用缓存策略
 
-### 1. 环境依赖
-* Linux 操作系统 (Ubuntu/CentOS)
-* CMake 3.10+
-* GCC 编译器 (支持 C++14)
-* MySQL Connector/C++ (`sudo apt-get install libmysqlcppconn-dev`)
+  * **ARC 算法**: 实现自适应替换缓存 (ARC)，自动平衡 LRU 与 LFU 逻辑，提升热点数据命中率。
+  * **分片锁设计**: 采用 16 分片 (Sharding) 技术降低全局锁竞争，大幅提升并发吞吐量。
+  * **企业级防御**:
+      * **防穿透**: 存入空对象标记并设置短期 TTL。
+      * **防击穿**: 结合分段锁 (Lock Striping) 与 Double-Check 机制。
+      * **防雪崩**: 引入 TTL 随机抖动 (Jitter)，避免缓存同时失效。
 
-### 2. 编译项目
-```bash
-git clone git@github.com:hjx1011/-Raft-Epoll-.git
-cd ./-Raft-Epoll-
-mkdir build && cd build
-cmake ..
-make
-```
+-----
 
-### 3. 运行分布式集群测试
-需要打开多个终端模拟分布式环境：
+## 🏗️ 系统架构 (Architecture)
 
-**启动底层的 Raft 共识集群：**
-```bash
-# 终端 1
-./raft_node 0
-# 终端 2
-./raft_node 1
-# 终端 3
-./raft_node 2
-```
+1.  **读路径 (Read Path)**: Client → Epoll Server → ARC Cache (Hit) → Response。
+2.  **写路径 (Write Path)**: Client → Raft Cluster (获取分布式锁) → MySQL (写入) → 更新缓存 → 释放锁。
 
-**启动 API 网关主程序：**
-```bash
-# 终端 4
-./gateway
-```
-
-**发送测试请求：**
-```bash
-# 终端 5: 写入数据 (将触发 Raft 抢锁与 MySQL 写入)
-curl -X POST "http://127.0.0.1:8080/set?key=hero&val=batman"
-
-# 读取数据 (将触发 Cache 极速秒回)
-curl "http://127.0.0.1:8080/get?key=hero"
-```
+-----
 
 ## 📂 目录结构 (Directory Structure)
-* `src/` : 网关主程序、Epoll Reactor 网络层实现。
-* `third_party/KamaCache/` : 自研分片 ARC 缓存模块与防御策略。
-* `third_party/KVstorageBaseRaft/` : 自研 Raft 分布式协议实现与 RPC 框架。
-* `tests/` : 并发防御与系统稳定性压测代码。
+
+```text
+.
+├── src/                # 网关核心逻辑与 Reactor 网络引擎
+├── third_party/
+│   ├── KamaCache/      # 自研分布式缓存模块 (ARC/LRU/LFU/分片锁)
+│   └── KVstorageBaseRaft/ # Raft 共识协议实现与状态机
+├── proto/              # gRPC 服务定义
+├── tests/              # 压力测试与并发场景测试工具
+└── start_cluster.sh    # 一键部署与集群启动脚本
+```
+
+-----
+
+## 🛠️ 构建与运行 (Getting Started)
+
+### 环境要求
+
+  * Ubuntu 18.04+
+  * CMake 3.10+
+  * gRPC & Protobuf
+  * MySQL Connector/C++
+
+### 编译与启动
+
+```bash
+# 1. 克隆并编译
+git clone <your-repo-url>
+mkdir build && cd build
+cmake .. && make -j4
+
+# 2. 一键启动集群 (3个Raft节点 + 1个网关)
+bash ../start_cluster.sh
+```
+
+### 接口测试
+
+```bash
+# 写入数据 (触发 Raft 抢锁)
+curl -X POST "http://127.0.0.1:8081/set?key=user_1&val=active"
+
+# 读取数据 (缓存加速)
+curl "http://127.0.0.1:8081/get?key=user_1"
+```
+
+-----
+
+## 📊 性能压测 (Benchmark)
+
+使用项目内置的 `benchmark` 工具进行离散键值对压测：
+
+```bash
+./build/benchmark <线程数> <每个线程请求数> <read/write>
+```
+
+在标准 Linux 环境下，系统可展示出卓越的 QPS 表现，特别是在开启分片锁后的缓存命中性能。
+
+-----
+
+## 📜 核心模块说明
+
+  * **CacheManager**: 封装了 `Cache-Aside` 模式，统一管理 Raft 锁与数据库写入。
+  * **RaftNode**: 负责维护任期 (Term)、心跳 (Heartbeat) 及日志的一致性。
+  * **EpollServer**: 负责非阻塞 I/O 的读写分发，支持千万级长连接并发潜力。
